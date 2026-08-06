@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Secrets / private infra - NEVER commit
+.env
+targets.json

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "MyTeam-CurrentSprint",
+    "project": "YOUR_PROJECT",
+    "area_path": "YOUR_PROJECT\\Your Team",
+    "iteration_path": "@current"
+  },
+  {
+    "name": "MyTeam-AllBacklog",
+    "project": "YOUR_PROJECT",
+    "area_path": "YOUR_PROJECT\\Your Team",
+    "iteration_path": "",
+    "work_item_types": ["Task", "Bug"]
+  },
+  {
+    "name": "AnotherProject-Team",
+    "project": "Some Other Project",
+    "area_path": "Some Other Project\\My Team",
+    "iteration_path": "@current",
+    "exclude_states": ["Closed", "Done", "Removed", "Resolved", "Completed"]
+  }
+]
