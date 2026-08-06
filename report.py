@@ -26,6 +26,22 @@ TRACKED_PEOPLE = {e.strip().lower()
                   if e.strip()}
 
 
+# A work item counts as blocked when its state says so, a process-specific
+# Blocked field is set, or it carries a "blocked" tag. Checked against fields
+# already fetched, so this costs no extra API call.
+BLOCKED_STATES = {"blocked", "on hold", "waiting"}
+BLOCKED_FIELDS = ("Microsoft.VSTS.CMMI.Blocked", "Microsoft.VSTS.Common.Blocked")
+
+
+def is_blocked(fields: dict[str, Any]) -> bool:
+    if (fields.get("System.State") or "").strip().lower() in BLOCKED_STATES:
+        return True
+    for key in BLOCKED_FIELDS:
+        if str(fields.get(key) or "").strip().lower() in {"yes", "true", "1"}:
+            return True
+    return "blocked" in (fields.get("System.Tags") or "").lower()
+
+
 def _parse(ts: Optional[str]) -> Optional[datetime]:
     if not ts:
         return None
@@ -107,6 +123,10 @@ def flag_items(items: list[dict[str, Any]], stale_days: int,
             "url": CONFIG.work_item_url(project, it.get("id")),
             "due": due_ref.date().isoformat() if due_ref else None,
             "days_since_update": days_since,
+            "tags": f.get("System.Tags") or "",
+            # Informational only -- deliberately NOT a flag reason, so blocked
+            # items don't start generating reminder emails on their own.
+            "blocked": is_blocked(f),
             "reasons": reasons,
         })
 

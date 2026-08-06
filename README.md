@@ -5,6 +5,11 @@ path), flags anything **overdue** or **stale** (not updated in N days), and
 emails each **assignee** their own list — sent **as you** via delegated
 Microsoft Graph.
 
+It also drills into a stalled item (comments, link graph, revision history),
+reports what is **blocking** it, reads and writes **wiki** pages, and can
+comment on / update / create work items — with writing off by default and
+gated twice.
+
 ## How it works
 
 1. **ADO** — a WIQL query returns open (non-done) items `UNDER` your area path
@@ -41,8 +46,21 @@ Not sure of your area path? After setting org/project/PAT, call
 
 ### Getting the ADO personal access token
 
-A PAT is the credential this server uses to read work items. **Read-only
-`Work Items → Read` is all it needs** — do not grant Full access.
+A PAT is the credential this server uses to talk to Azure DevOps. Grant the
+**narrowest scope for the tools you actually intend to use** — there is no
+reason to hand it Full access:
+
+| You want | Scopes to grant |
+|----------|-----------------|
+| Monitoring + reminder emails (the default) | `Work Items → Read` |
+| `get_work_item`, `blocked_items` | `Work Items → Read` |
+| `list_wiki_pages`, `get_wiki_page` | `Wiki → Read` |
+| `add_work_item_comment`, `update_work_item`, `create_work_item` | `Work Items → Read & Write` |
+| `create_or_update_wiki_page` | `Wiki → Read & Write` |
+
+Read-only is the right default: with `ENABLE_WRITE=false` (the shipped value)
+the write tools refuse before making any request, so a read-only PAT loses you
+nothing.
 
 1. Sign in to your Azure DevOps organization: `https://dev.azure.com/YOUR_ORG`
 2. Open **User settings** (the icon beside your avatar, top right) →
@@ -97,19 +115,61 @@ single target.
 
 ## Tools
 
-| Tool | Sends email? | Purpose |
-|------|:---:|---------|
-| `list_targets` | no | Show the resolved scan targets |
-| `test_connection` | no | Verify PAT + config, show open-item count |
-| `list_area_paths` | no | Print area-path tree for a project |
-| `current_iteration` | no | Show configured vs resolved sprint (`@current`) |
-| `scan` | no | Flag overdue/stale items grouped by assignee |
-| `preview_notifications` | no | Render the exact per-assignee emails |
-| `send_notifications` | **yes** | Send — **only when `ENABLE_SEND=true` and `confirm=True`** |
+### Read-only
 
-**Safety:** every tool but the last is read-only, and `send_notifications`
-sends nothing unless `ENABLE_SEND=true` in `.env` **and** you pass
-`confirm=True`. The first Graph call pops a WAM sign-in; after that it's silent.
+| Tool | Purpose |
+|------|---------|
+| `list_targets` | Show the resolved scan targets |
+| `test_connection` | Verify PAT + config, show open-item count |
+| `list_area_paths` | Print area-path tree for a project |
+| `current_iteration` | Show configured vs resolved sprint (`@current`) |
+| `scan` | Flag overdue/stale items grouped by assignee |
+| `get_work_item` | One item in full — fields, links, comments, revision history |
+| `blocked_items` | Blocked items **and what is blocking them** |
+| `list_wiki_pages` | Wiki page hierarchy |
+| `get_wiki_page` | One wiki page's markdown (+ etag) |
+| `preview_notifications` | Render the exact per-assignee emails |
+
+### Changes something — each gated twice
+
+| Tool | Needs | Purpose |
+|------|-------|---------|
+| `add_work_item_comment` | `ENABLE_WRITE` + `confirm` | Post a discussion comment |
+| `update_work_item` | `ENABLE_WRITE` + `confirm` | Change state / assignee / dates / any field |
+| `create_work_item` | `ENABLE_WRITE` + `confirm` | Create an item, optionally under a parent |
+| `create_or_update_wiki_page` | `ENABLE_WRITE` + `confirm` (+ `allow_overwrite`) | Write a wiki page |
+| `send_notifications` | `ENABLE_SEND` + `confirm` | Send the reminder emails |
+
+**Safety model.** Nothing outside your machine changes unless you opt in twice:
+an `.env` master switch (`ENABLE_WRITE` / `ENABLE_SEND`, both default **off**)
+*and* an explicit `confirm=True` on the call. Extra guards:
+
+- `update_work_item` and `create_work_item` accept `validate_only=True`, which
+  asks Azure DevOps to validate the change and **save nothing** — a real dry
+  run against the server, usable even with `ENABLE_WRITE=false`.
+- `create_or_update_wiki_page` always reads the page first and reports what
+  would change. Overwriting an **existing** page also needs
+  `allow_overwrite=True`, because the whole page is replaced, not merged — and
+  the response echoes the previous content so an unwanted overwrite is
+  recoverable.
+- The first Graph call pops a WAM sign-in; after that it's silent.
+
+### Drilling into a stalled item
+
+`scan` returns a dozen summary fields per item — enough to flag it, not enough
+to explain it. `get_work_item` adds the discussion, the parent/child chain, and
+a per-revision changelog, so you can tell a genuinely untouched item from one
+being nudged without progress:
+
+```
+scan(only_flagged=True) → get_work_item(id=33740, include_history=True)
+```
+
+`blocked_items` answers the related question — *is this stalled because of
+someone else?* It reports items whose state/tags declare them blocked, plus
+items with an unfinished **predecessor** link, naming the blocker. Chasing an
+assignee whose work is gated on another open item is how reminder emails lose
+their credibility.
 
 ### Suggested flow
 `test_connection` → `scan` → `preview_notifications` → `send_notifications(confirm=True)`

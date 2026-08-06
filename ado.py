@@ -37,9 +37,26 @@ FIELDS = [
     "System.TeamProject",
     "System.AreaPath",
     "System.IterationPath",
+    "System.Tags",
     "Microsoft.VSTS.Scheduling.DueDate",
     "Microsoft.VSTS.Scheduling.TargetDate",
 ]
+
+# The comments endpoint is still preview-only in api-version 7.1.
+COMMENTS_API = "7.1-preview.4"
+
+# Work-item link types, mapped to plain-English names.
+LINK_NAMES = {
+    "System.LinkTypes.Hierarchy-Reverse": "parent",
+    "System.LinkTypes.Hierarchy-Forward": "child",
+    "System.LinkTypes.Dependency-Reverse": "predecessor",
+    "System.LinkTypes.Dependency-Forward": "successor",
+    "System.LinkTypes.Related": "related",
+    "System.LinkTypes.Duplicate-Reverse": "duplicate-of",
+    "System.LinkTypes.Duplicate-Forward": "duplicate",
+}
+# A predecessor in one of these states no longer blocks its successor.
+DONE_STATES = {"closed", "done", "removed", "resolved", "completed"}
 
 DEFAULT_EXCLUDE_STATES = "Closed,Done,Removed,Resolved,Completed"
 
@@ -319,5 +336,234 @@ def list_area_paths(project: str, depth: int = 10) -> dict[str, Any]:
     url = (f"{_wit_base(project)}/classificationnodes/areas"
            f"?$depth={depth}&api-version={API_VERSION}")
     resp = requests.get(url, timeout=60, headers=_auth_header())
+    resp.raise_for_status()
+    return resp.json()
+
+
+# --------------------------------------------------------------------------
+# Single-item detail: fields + relations + comments + revision history
+# --------------------------------------------------------------------------
+def get_work_item(project: str, wid: int,
+                  expand: str = "all") -> dict[str, Any]:
+    """One work item with every field and (with expand='all') its relations."""
+    url = (f"{_wit_base(project)}/workitems/{int(wid)}"
+           f"?$expand={expand}&api-version={API_VERSION}")
+    resp = requests.get(url, timeout=60, headers=_auth_header())
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_comments(project: str, wid: int, top: int = 50) -> list[dict[str, Any]]:
+    """Discussion comments, newest first."""
+    url = (f"{_wit_base(project)}/workItems/{int(wid)}/comments"
+           f"?$top={int(top)}&order=desc&api-version={COMMENTS_API}")
+    resp = requests.get(url, timeout=60, headers=_auth_header())
+    resp.raise_for_status()
+    return resp.json().get("comments", [])
+
+
+def get_revisions(project: str, wid: int) -> list[dict[str, Any]]:
+    """Raw revision records (each holds only the FIELDS THAT CHANGED)."""
+    url = (f"{_wit_base(project)}/workItems/{int(wid)}/updates"
+           f"?api-version={API_VERSION}")
+    resp = requests.get(url, timeout=60, headers=_auth_header())
+    resp.raise_for_status()
+    return resp.json().get("value", [])
+
+
+def relation_summary(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten an expanded item's ``relations`` into typed links.
+
+    Work-item links carry the linked id (parsed off the URL); attachments and
+    hyperlinks are reported by name/url instead.
+    """
+    out: list[dict[str, Any]] = []
+    for rel in item.get("relations") or []:
+        kind = rel.get("rel") or ""
+        url = rel.get("url") or ""
+        entry: dict[str, Any] = {
+            "link_type": LINK_NAMES.get(kind, kind),
+            "raw_rel": kind,
+            "name": (rel.get("attributes") or {}).get("name"),
+        }
+        if "/workItems/" in url or "/workitems/" in url:
+            tail = url.rstrip("/").rsplit("/", 1)[-1]
+            entry["id"] = int(tail) if tail.isdigit() else None
+        else:
+            entry["url"] = url
+        out.append(entry)
+    return out
+
+
+def get_items_expanded(project: str, ids: list[int],
+                       expand: str = "all") -> list[dict[str, Any]]:
+    """Batch-fetch items WITH relations (200/req).
+
+    ``$expand`` and an explicit ``fields`` list are mutually exclusive in the
+    batch API, so this returns every field rather than :data:`FIELDS`.
+    """
+    out: list[dict[str, Any]] = []
+    url = f"{_wit_base(project)}/workitemsbatch?api-version={API_VERSION}"
+    for i in range(0, len(ids), 200):
+        resp = requests.post(
+            url, timeout=90,
+            headers={**_auth_header(), "Content-Type": "application/json"},
+            json={"ids": ids[i:i + 200], "$expand": expand})
+        resp.raise_for_status()
+        for it in resp.json().get("value", []):
+            it["_project"] = project
+            out.append(it)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Wiki
+# --------------------------------------------------------------------------
+def _wiki_base(project: str) -> str:
+    return f"{CONFIG.org_url}/{requests.utils.quote(project)}/_apis/wiki"
+
+
+def list_wikis(project: str) -> list[dict[str, Any]]:
+    resp = requests.get(f"{_wiki_base(project)}/wikis",
+                        params={"api-version": API_VERSION},
+                        timeout=60, headers=_auth_header())
+    resp.raise_for_status()
+    return resp.json().get("value", [])
+
+
+def resolve_wiki(project: str, wiki: Optional[str] = None) -> dict[str, Any]:
+    """Resolve a wiki by name or id, defaulting to the project's only wiki."""
+    wikis = list_wikis(project)
+    if not wikis:
+        raise ValueError(f"No wiki exists in project '{project}'.")
+    if not wiki:
+        return wikis[0]
+    key = wiki.strip().lower()
+    for w in wikis:
+        if key in {str(w.get("id", "")).lower(), (w.get("name") or "").lower()}:
+            return w
+    raise ValueError(f"Unknown wiki '{wiki}'. Known: "
+                     f"{[w.get('name') for w in wikis]}")
+
+
+def _path_variants(path: str) -> list[str]:
+    """Candidate spellings of a wiki path.
+
+    ADO stores a page named ``My Page`` at path ``/My Page`` but on disk as
+    ``My-Page.md``, and different callers spell it either way -- so try the
+    given form first, then swap spaces and hyphens.
+    """
+    p = "/" + (path or "").strip().lstrip("/")
+    seen, out = set(), []
+    for cand in (p, p.replace(" ", "-"), p.replace("-", " ")):
+        if cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
+def get_wiki_page(project: str, wiki_id: str, path: str,
+                  include_content: bool = True) -> Optional[dict[str, Any]]:
+    """Fetch a page (trying path spellings). Returns None when it doesn't exist.
+
+    The returned dict carries ``etag``, which :func:`upsert_wiki_page` needs as
+    ``If-Match`` to update the page without clobbering a concurrent edit.
+    """
+    for cand in _path_variants(path):
+        resp = requests.get(
+            f"{_wiki_base(project)}/wikis/{wiki_id}/pages",
+            params={"path": cand, "includeContent": str(include_content).lower(),
+                    "api-version": API_VERSION},
+            timeout=60, headers=_auth_header())
+        if resp.status_code == 404:
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        # ADO quotes the ETag; If-Match must send it back verbatim.
+        data["etag"] = (resp.headers.get("ETag") or "").strip()
+        data["resolved_path"] = cand
+        return data
+    return None
+
+
+def wiki_page_tree(project: str, wiki_id: str, path: str = "/",
+                   recursion: str = "full") -> Optional[dict[str, Any]]:
+    """Page hierarchy under ``path`` (recursion: none|oneLevel|full)."""
+    for cand in _path_variants(path):
+        resp = requests.get(
+            f"{_wiki_base(project)}/wikis/{wiki_id}/pages",
+            params={"path": cand, "recursionLevel": recursion,
+                    "api-version": API_VERSION},
+            timeout=90, headers=_auth_header())
+        if resp.status_code == 404:
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    return None
+
+
+def upsert_wiki_page(project: str, wiki_id: str, path: str, content: str,
+                     etag: Optional[str] = None) -> dict[str, Any]:
+    """Create (no etag) or update (etag as If-Match) a wiki page.
+
+    ADO requires If-Match on an update and rejects it on a create, so the
+    caller must pass the etag from :func:`get_wiki_page` for existing pages.
+    """
+    headers = {**_auth_header(), "Content-Type": "application/json"}
+    if etag:
+        headers["If-Match"] = etag
+    resp = requests.put(
+        f"{_wiki_base(project)}/wikis/{wiki_id}/pages",
+        params={"path": path, "api-version": API_VERSION},
+        timeout=90, headers=headers, json={"content": content})
+    resp.raise_for_status()
+    return {"status": resp.status_code, "created": resp.status_code == 201,
+            "path": path, "page": resp.json()}
+
+
+# --------------------------------------------------------------------------
+# Work-item writes (every caller must gate these behind ENABLE_WRITE)
+# --------------------------------------------------------------------------
+def _patch_headers() -> dict[str, str]:
+    return {**_auth_header(), "Content-Type": "application/json-patch+json"}
+
+
+def patch_work_item(project: str, wid: int, ops: list[dict[str, Any]],
+                    validate_only: bool = False,
+                    suppress_notifications: bool = False) -> dict[str, Any]:
+    """Apply a JSON-Patch to an existing item. ``validate_only`` saves nothing."""
+    params = {"api-version": API_VERSION}
+    if validate_only:
+        params["validateOnly"] = "true"
+    if suppress_notifications:
+        params["suppressNotifications"] = "true"
+    resp = requests.patch(f"{_wit_base(project)}/workitems/{int(wid)}",
+                          params=params, timeout=60,
+                          headers=_patch_headers(), json=ops)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_work_item(project: str, wit_type: str, ops: list[dict[str, Any]],
+                     validate_only: bool = False) -> dict[str, Any]:
+    """Create a work item of ``wit_type``. ``validate_only`` creates nothing."""
+    params = {"api-version": API_VERSION}
+    if validate_only:
+        params["validateOnly"] = "true"
+    wt = requests.utils.quote(wit_type)
+    resp = requests.post(f"{_wit_base(project)}/workitems/${wt}",
+                         params=params, timeout=60,
+                         headers=_patch_headers(), json=ops)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def add_comment(project: str, wid: int, text: str) -> dict[str, Any]:
+    """Post a discussion comment (does not touch any field)."""
+    resp = requests.post(
+        f"{_wit_base(project)}/workItems/{int(wid)}/comments",
+        params={"api-version": COMMENTS_API}, timeout=60,
+        headers={**_auth_header(), "Content-Type": "application/json"},
+        json={"text": text})
     resp.raise_for_status()
     return resp.json()
