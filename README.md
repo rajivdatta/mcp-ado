@@ -39,6 +39,44 @@ Fill in `.env`:
 Not sure of your area path? After setting org/project/PAT, call
 `list_area_paths` to print the tree.
 
+### Getting the ADO personal access token
+
+A PAT is the credential this server uses to read work items. **Read-only
+`Work Items → Read` is all it needs** — do not grant Full access.
+
+1. Sign in to your Azure DevOps organization: `https://dev.azure.com/YOUR_ORG`
+2. Open **User settings** (the icon beside your avatar, top right) →
+   **Personal access tokens**. Direct link:
+   `https://dev.azure.com/YOUR_ORG/_usersSettings/tokens`
+3. Click **+ New Token**.
+4. Fill in the token:
+   - **Name** — anything memorable, e.g. `mcp-ado`
+   - **Organization** — the org holding the work items. If you belong to
+     several, a token scoped to one org will **not** work against another.
+   - **Expiration** — pick the shortest window you'll tolerate re-issuing.
+5. Under **Scopes**, choose **Custom defined**, then expand **Work Items** and
+   tick **Read**. Leave everything else unchecked.
+6. Click **Create**, then **copy the token immediately** — Azure DevOps shows
+   it exactly once and you cannot retrieve it afterwards.
+7. Paste it into `.env` as `ADO_PAT=...`, then verify with the
+   `test_connection` tool, which reports the open-item count on success.
+
+`.env` is listed in `.gitignore`, so the token stays out of git. Keep it that
+way — a PAT is a bearer credential, so anyone holding it has your read access
+until it expires or you revoke it.
+
+**When it stops working.** PATs expire, and an expired or revoked token fails
+every call. If `test_connection` starts returning an authentication error — or
+an HTML sign-in page instead of JSON — re-issue the token at the same
+**Personal access tokens** page and update `.env`. Two other causes worth
+ruling out: the token was scoped to a different organization than
+`ADO_ORG_URL`, or it lacks the `Work Items → Read` scope. Some organizations
+also restrict who may create PATs at all; if **+ New Token** is unavailable,
+your Azure DevOps administrator has to permit it.
+
+Note that the email side uses **no** PAT — it signs in through the Windows WAM
+broker instead, so `ADO_PAT` only ever governs reading work items.
+
 ### Scanning more than one team
 
 Drop a `targets.json` next to `server.py` to scan several
