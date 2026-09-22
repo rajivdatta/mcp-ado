@@ -1,12 +1,15 @@
-"""Flagging logic + HTML rendering for the ADO task-monitor MCP.
+"""Flagging logic for the Azure DevOps MCP.
 
 An open work item is *flagged* when it is either:
   * OVERDUE  - its Due Date or Target Date is strictly before today (UTC), or
   * STALE    - its last ChangedDate is older than STALE_DAYS days.
 
-Flagged items are grouped by assignee (across ALL targets) so each person can
-be emailed one combined list. Items with no assignee are grouped under the
-sentinel ``None`` and routed to the fallback recipient by the caller.
+Flagged items are grouped by assignee (across ALL targets), so one person's
+whole list arrives together rather than split per scope. Items with no assignee
+are grouped under the sentinel ``None`` for the caller to handle.
+
+The HTML e-mail renderer that used to live here was removed 2026-08-12 along
+with the notification tools; this module is now pure flagging/grouping.
 """
 from __future__ import annotations
 
@@ -124,8 +127,8 @@ def flag_items(items: list[dict[str, Any]], stale_days: int,
             "due": due_ref.date().isoformat() if due_ref else None,
             "days_since_update": days_since,
             "tags": f.get("System.Tags") or "",
-            # Informational only -- deliberately NOT a flag reason, so blocked
-            # items don't start generating reminder emails on their own.
+            # Informational only -- deliberately NOT a flag reason, so an item
+            # being blocked doesn't by itself make it show up as needing action.
             "blocked": is_blocked(f),
             "reasons": reasons,
         })
@@ -135,52 +138,3 @@ def flag_items(items: list[dict[str, Any]], stale_days: int,
             key=lambda r: (0 if any("Overdue" in x for x in r["reasons"]) else 1,
                            -(r["days_since_update"] or 0)))
     return groups
-
-
-# --------------------------------------------------------------------------
-# HTML rendering (Outlook-safe inline CSS)
-# --------------------------------------------------------------------------
-def render_email(display_name: str, rows: list[dict[str, Any]],
-                 stale_days: int) -> str:
-    def cell(v: str, extra: str = "") -> str:
-        return (f'<td style="padding:6px 12px;border-bottom:1px solid #e3e3e3;'
-                f'{extra}">{v}</td>')
-
-    body_rows = ""
-    for r in rows:
-        reason = "<br>".join(r["reasons"])
-        overdue = any("Overdue" in x for x in r["reasons"])
-        rc = "color:#b00020;font-weight:600;" if overdue else "color:#8a6d00;"
-        link = (f'<a href="{r["url"]}" style="color:#0b5cad;text-decoration:none">'
-                f'#{r["id"]}</a>')
-        body_rows += (
-            "<tr>"
-            + cell(link) + cell(r["type"]) + cell(r["title"])
-            + cell(r.get("area", "")) + cell(r.get("sprint", ""))
-            + cell(r["state"]) + cell(reason, extra=rc)
-            + "</tr>")
-
-    th = ("padding:8px 12px;background:#0b3d5c;color:#fff;text-align:left;"
-          "font-weight:600;")
-    first = display_name.split(" ")[0] if display_name else "there"
-    areas = sorted({r.get("area_path", "") for r in rows if r.get("area_path")})
-    scope = "; ".join(areas) if areas else "your work items"
-    return f"""<div style="font-family:Segoe UI,Arial,sans-serif;color:#222;max-width:960px">
-  <p style="margin:0 0 12px">Hi {first},</p>
-  <p style="margin:0 0 12px;color:#333">
-    The following Azure DevOps work item(s) assigned to you are
-    <b>overdue</b> or have <b>not been updated in {stale_days}+ days</b>.
-    Please review and update them.</p>
-  <table style="border-collapse:collapse;width:100%;font-size:14px">
-    <thead><tr>
-      <th style="{th}">ID</th><th style="{th}">Type</th>
-      <th style="{th}">Title</th><th style="{th}">Area</th>
-      <th style="{th}">Sprint</th><th style="{th}">State</th>
-      <th style="{th}">Why flagged</th>
-    </tr></thead>
-    <tbody>{body_rows}</tbody>
-  </table>
-  <p style="margin:14px 0 0;color:#888;font-size:11px">
-    Automated reminder from the ADO task monitor &middot;
-    {len(rows)} item(s) &middot; {scope}.</p>
-</div>"""

@@ -1,30 +1,29 @@
-"""ADO Task Monitor MCP.
+"""Azure DevOps MCP.
 
-Scans one or more Azure DevOps scopes (project + area + iteration -- see
-targets.json), flags work items that are overdue or stale, and emails each
-assignee ONE combined list of everything assigned to them across all scopes --
-sent as you via delegated Microsoft Graph.
+Reads one or more Azure DevOps scopes (project + area + iteration -- see
+targets.json): lists and inspects work items, flags the ones that are overdue
+or stale, reports what is blocking them, and reads/writes wiki pages.
+
+Notification/email delivery was removed 2026-08-12 -- this server talks to
+Azure DevOps only, and sends nothing. `scan` returns the flagged items grouped
+by assignee so the caller can decide what to do with them.
 
 Read-only tools:
   list_targets           show the configured scopes
   test_connection        verify PAT + config; open-item count per target
   list_area_paths        print a project's area-path tree (config discovery)
   current_iteration      show the sprint @current resolves to per target
-  scan                   flag overdue/stale items, grouped by assignee (no email)
+  scan                   flag overdue/stale items, grouped by assignee
   get_work_item          one item in full: fields, links, comments, history
   blocked_items          blocked items + WHAT is blocking them
   list_wiki_pages        wiki page hierarchy
   get_wiki_page          one wiki page's markdown
-  preview_notifications  build the per-assignee emails (dry run, no send)
 
 Writing tools -- all refuse unless ENABLE_WRITE=true AND confirm=True:
   add_work_item_comment  post a discussion comment
   update_work_item       change state / assignee / dates / fields
   create_work_item       create a new item
   create_or_update_wiki_page   write a wiki page (read-before-write guarded)
-
-Emailing tool -- refuses unless ENABLE_SEND=true AND confirm=True:
-  send_notifications     actually send the per-assignee reminders
 """
 from __future__ import annotations
 
@@ -33,20 +32,13 @@ import os
 from mcp.server.fastmcp import FastMCP
 
 import ado
-import mailer
-from report import (DEFAULT_STALE_DAYS, TRACKED_PEOPLE, flag_items, is_blocked,
-                    render_email)
+from report import DEFAULT_STALE_DAYS, TRACKED_PEOPLE, flag_items, is_blocked
 
 mcp = FastMCP("ado")
 
-# Master kill-switches. Both default OFF: the server cannot send mail or change
-# anything in Azure DevOps until they are explicitly turned on in .env.
-ENABLE_SEND = (os.environ.get("ENABLE_SEND", "false").strip().lower() == "true")
+# Master kill-switch. Defaults OFF: the server cannot change anything in Azure
+# DevOps until it is explicitly turned on in .env.
 ENABLE_WRITE = (os.environ.get("ENABLE_WRITE", "false").strip().lower() == "true")
-
-SUBJECT_PREFIX = os.environ.get("MAIL_SUBJECT_PREFIX", "[ADO Reminder]")
-FALLBACK_TO = os.environ.get("MAIL_FALLBACK_TO", "").strip()
-CC = [c.strip() for c in (os.environ.get("MAIL_CC") or "").split(",") if c.strip()]
 
 
 def _flatten(nodes):
@@ -632,76 +624,6 @@ def create_work_item(title: str, type: str = "Task",
     item = ado.create_work_item(proj, type, ops)
     return {**plan, "written": True, "id": item.get("id"),
             "url": ado.CONFIG.work_item_url(proj, item.get("id"))}
-
-
-def _subject(email, g):
-    if email is None:
-        return f"{SUBJECT_PREFIX} {len(g['items'])} UNASSIGNED work item(s)"
-    return f"{SUBJECT_PREFIX} {len(g['items'])} work item(s) need your attention"
-
-
-@mcp.tool()
-def preview_notifications(days_stale: int | None = None) -> dict:
-    """Build the per-assignee reminder emails WITHOUT sending."""
-    stale = days_stale if days_stale is not None else DEFAULT_STALE_DAYS
-    groups = flag_items(ado.collect_items(), stale)
-    previews = []
-    for email, g in groups.items():
-        previews.append({
-            "to": (email or FALLBACK_TO) or "(no recipient - set MAIL_FALLBACK_TO)",
-            "assignee": g["display_name"],
-            "unassigned": email is None,
-            "item_count": len(g["items"]),
-            "subject": _subject(email, g),
-            "cc": CC,
-            "html": render_email(g["display_name"], g["items"], stale),
-        })
-    return {"stale_days": stale, "email_count": len(previews), "emails": previews}
-
-
-@mcp.tool()
-def send_notifications(days_stale: int | None = None,
-                       confirm: bool = False,
-                       skip_unassigned: bool = True) -> dict:
-    """Send reminder emails to each assignee (as you, via Graph).
-
-    Sends ONLY when ENABLE_SEND=true in .env AND confirm=True. Otherwise
-    returns what would be sent.
-    """
-    stale = days_stale if days_stale is not None else DEFAULT_STALE_DAYS
-    groups = flag_items(ado.collect_items(), stale)
-
-    planned = []
-    for email, g in groups.items():
-        if email is None and skip_unassigned:
-            continue
-        to = email or FALLBACK_TO
-        if not to:
-            continue
-        planned.append((to, _subject(email, g), g))
-
-    if not ENABLE_SEND:
-        return {"sent": False,
-                "reason": "ENABLE_SEND is false -- sending disabled. Set "
-                          "ENABLE_SEND=true in .env to allow sending.",
-                "would_send_count": len(planned),
-                "recipients": [p[0] for p in planned]}
-    if not confirm:
-        return {"sent": False,
-                "reason": "confirm=False -- nothing sent. Re-run with confirm=True.",
-                "would_send_count": len(planned),
-                "recipients": [p[0] for p in planned]}
-
-    results = []
-    for to, subj, g in planned:
-        try:
-            mailer.send_mail(to=[to], subject=subj,
-                             html=render_email(g["display_name"], g["items"], stale),
-                             cc=CC)
-            results.append({"to": to, "status": "sent", "items": len(g["items"])})
-        except Exception as e:  # noqa: BLE001
-            results.append({"to": to, "status": "failed", "error": str(e)})
-    return {"sent": True, "stale_days": stale, "results": results}
 
 
 if __name__ == "__main__":

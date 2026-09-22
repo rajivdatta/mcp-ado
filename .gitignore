@@ -8,3 +8,6 @@ __pycache__/
 # Secrets / private infra - NEVER commit
 .env
 targets.json
+
+# Local .env backups
+.env.bak*

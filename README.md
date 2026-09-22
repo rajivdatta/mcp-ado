@@ -1,24 +1,30 @@
 # mcp-ado
 
-A FastMCP server that scans your team's **Azure DevOps** work items (by area
+A FastMCP server for **Azure DevOps**. It scans your team's work items (by area
 path), flags anything **overdue** or **stale** (not updated in N days), and
-emails each **assignee** their own list — sent **as you** via delegated
-Microsoft Graph.
+returns them grouped by **assignee**.
 
 It also drills into a stalled item (comments, link graph, revision history),
 reports what is **blocking** it, reads and writes **wiki** pages, and can
 comment on / update / create work items — with writing off by default and
 gated twice.
 
+> **Note (2026-08-12):** e-mail/notification delivery was removed. Earlier
+> versions could send each assignee an HTML reminder from your own mailbox via
+> delegated Microsoft Graph; the `preview_notifications` and
+> `send_notifications` tools, the `mailer` module, the `MAIL_*` / `ENABLE_SEND`
+> / `TENANT_ID` settings and the `azure-identity*` dependencies are all gone.
+> **This server talks to Azure DevOps only and sends nothing.** `scan` still
+> returns the flagged items grouped by assignee, so a caller can decide what to
+> do with them.
+
 ## How it works
 
 1. **ADO** — a WIQL query returns open (non-done) items `UNDER` your area path
    using a PAT (Work Items → Read). Fields are batch-fetched.
 2. **Flagging** — an item is flagged if its Due/Target date is past, **or** its
-   `ChangedDate` is older than `STALE_DAYS`. Results are grouped by assignee.
-3. **Email** — each assignee gets an HTML reminder listing only their items,
-   sent from your mailbox via Graph `/me/sendMail`. Auth is the Windows WAM
-   broker (no secret, no pasted token) — same pattern as the ADF MCP.
+   `ChangedDate` is older than `STALE_DAYS`. Results are grouped by assignee and
+   returned to the caller.
 
 ## Setup
 
@@ -38,8 +44,7 @@ Fill in `.env`:
   start/finish dates contain today
 - `TRACK_PEOPLE` — optional CSV of assignee emails; when set, only those
   people's items are flagged. Blank = everyone.
-- `ENABLE_SEND` — master kill-switch for email, **default off**
-- `MAIL_CC` / `MAIL_FALLBACK_TO` (optional)
+- `ENABLE_WRITE` — master kill-switch for all writes, **default off**
 
 Not sure of your area path? After setting org/project/PAT, call
 `list_area_paths` to print the tree.
@@ -52,7 +57,7 @@ reason to hand it Full access:
 
 | You want | Scopes to grant |
 |----------|-----------------|
-| Monitoring + reminder emails (the default) | `Work Items → Read` |
+| Monitoring / `scan` (the default) | `Work Items → Read` |
 | `get_work_item`, `blocked_items` | `Work Items → Read` |
 | `list_wiki_pages`, `get_wiki_page` | `Wiki → Read` |
 | `add_work_item_comment`, `update_work_item`, `create_work_item` | `Work Items → Read & Write` |
@@ -92,8 +97,8 @@ ruling out: the token was scoped to a different organization than
 also restrict who may create PATs at all; if **+ New Token** is unavailable,
 your Azure DevOps administrator has to permit it.
 
-Note that the email side uses **no** PAT — it signs in through the Windows WAM
-broker instead, so `ADO_PAT` only ever governs reading work items.
+The PAT is now the server's **only** credential — with e-mail removed there is
+no second sign-in path and no Graph token.
 
 ### Scanning more than one team
 
@@ -109,7 +114,8 @@ project/area/iteration combinations in one pass (org + PAT stay global in
 ```
 
 Items are de-duplicated by id across targets, and a person with flagged items
-in several targets gets **one** combined email. Without `targets.json`, the
+in several targets is reported **once**, with their items merged into a single
+group. Without `targets.json`, the
 `ADO_PROJECT` / `ADO_AREA_PATH` / `ADO_ITERATION_PATH` env values are used as a
 single target.
 
@@ -128,7 +134,6 @@ single target.
 | `blocked_items` | Blocked items **and what is blocking them** |
 | `list_wiki_pages` | Wiki page hierarchy |
 | `get_wiki_page` | One wiki page's markdown (+ etag) |
-| `preview_notifications` | Render the exact per-assignee emails |
 
 ### Changes something — each gated twice
 
@@ -138,11 +143,10 @@ single target.
 | `update_work_item` | `ENABLE_WRITE` + `confirm` | Change state / assignee / dates / any field |
 | `create_work_item` | `ENABLE_WRITE` + `confirm` | Create an item, optionally under a parent |
 | `create_or_update_wiki_page` | `ENABLE_WRITE` + `confirm` (+ `allow_overwrite`) | Write a wiki page |
-| `send_notifications` | `ENABLE_SEND` + `confirm` | Send the reminder emails |
 
-**Safety model.** Nothing outside your machine changes unless you opt in twice:
-an `.env` master switch (`ENABLE_WRITE` / `ENABLE_SEND`, both default **off**)
-*and* an explicit `confirm=True` on the call. Extra guards:
+**Safety model.** Nothing in Azure DevOps changes unless you opt in twice: the
+`.env` master switch (`ENABLE_WRITE`, default **off**) *and* an explicit
+`confirm=True` on the call. Extra guards:
 
 - `update_work_item` and `create_work_item` accept `validate_only=True`, which
   asks Azure DevOps to validate the change and **save nothing** — a real dry
@@ -152,7 +156,8 @@ an `.env` master switch (`ENABLE_WRITE` / `ENABLE_SEND`, both default **off**)
   `allow_overwrite=True`, because the whole page is replaced, not merged — and
   the response echoes the previous content so an unwanted overwrite is
   recoverable.
-- The first Graph call pops a WAM sign-in; after that it's silent.
+- Nothing leaves your machine except Azure DevOps API calls — there is no mail
+  path and no second credential.
 
 ### Drilling into a stalled item
 
@@ -168,11 +173,11 @@ scan(only_flagged=True) → get_work_item(id=33740, include_history=True)
 `blocked_items` answers the related question — *is this stalled because of
 someone else?* It reports items whose state/tags declare them blocked, plus
 items with an unfinished **predecessor** link, naming the blocker. Chasing an
-assignee whose work is gated on another open item is how reminder emails lose
-their credibility.
+assignee whose work is gated on another open item wastes everyone's time, so
+check this before acting on a `scan` result.
 
 ### Suggested flow
-`test_connection` → `scan` → `preview_notifications` → `send_notifications(confirm=True)`
+`test_connection` → `scan` → `get_work_item` / `blocked_items` on anything flagged
 
 ## Register with Claude
 
@@ -192,11 +197,11 @@ Add to your MCP config (`claude_desktop_config.json` for Desktop, or via
 
 ## Notes
 
-- **Delegated Mail.Send consent.** The broker signs in with the Azure CLI
-  first-party client by default. If tenant policy blocks Mail.Send consent for
-  it, register a public-client app with delegated `Mail.Send` + `User.Read`
-  and set `GRAPH_CLIENT_ID` to its id.
-- **Scheduling.** For a daily run, wrap `send_notifications(confirm=True)` in a
-  small script and drive it from Windows Task Scheduler, or ask Claude to run
-  the tool on a schedule.
+- **Scheduling.** For a recurring check, ask Claude to run `scan` on a schedule,
+  or drive it from Windows Task Scheduler with a small script that imports
+  `server.py` and calls `scan()`.
 - Dates are compared in UTC.
+- **Dependencies** are now just `mcp`, `requests` and `python-dotenv`. The
+  `azure-identity` / `azure-identity-broker` packages existed only for the Graph
+  mail sign-in and were dropped; you can prune them from an existing `.venv`
+  with `pip uninstall azure-identity azure-identity-broker`.

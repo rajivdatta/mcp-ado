@@ -528,6 +528,27 @@ def _patch_headers() -> dict[str, str]:
     return {**_auth_header(), "Content-Type": "application/json-patch+json"}
 
 
+def _raise_with_body(resp) -> None:
+    """raise_for_status, but surface Azure DevOps' own error message.
+
+    Bare raise_for_status() hides the response body, which is where ADO puts
+    the actual reason (invalid field, bad value, rule violation). Without this
+    every 400 reads as an opaque "400 Client Error".
+    """
+    if resp.status_code < 400:
+        return
+    detail = ""
+    try:
+        body = resp.json()
+        detail = body.get("message") or body.get("value", {}).get("Message") or ""
+    except Exception:
+        detail = (resp.text or "")[:1000]
+    raise requests.HTTPError(
+        f"{resp.status_code} {resp.reason} for {resp.url}"
+        + (f" -- {detail}" if detail else " -- (empty response body)"),
+        response=resp)
+
+
 def patch_work_item(project: str, wid: int, ops: list[dict[str, Any]],
                     validate_only: bool = False,
                     suppress_notifications: bool = False) -> dict[str, Any]:
@@ -540,7 +561,7 @@ def patch_work_item(project: str, wid: int, ops: list[dict[str, Any]],
     resp = requests.patch(f"{_wit_base(project)}/workitems/{int(wid)}",
                           params=params, timeout=60,
                           headers=_patch_headers(), json=ops)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
@@ -554,7 +575,7 @@ def create_work_item(project: str, wit_type: str, ops: list[dict[str, Any]],
     resp = requests.post(f"{_wit_base(project)}/workitems/${wt}",
                          params=params, timeout=60,
                          headers=_patch_headers(), json=ops)
-    resp.raise_for_status()
+    _raise_with_body(resp)
     return resp.json()
 
 
